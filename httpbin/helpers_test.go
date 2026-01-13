@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,7 +110,6 @@ func TestParseDuration(t *testing.T) {
 		{"-2.5", -2500 * time.Millisecond},
 	}
 	for _, test := range okTests {
-		test := test
 		t.Run(fmt.Sprintf("ok/%s", test.input), func(t *testing.T) {
 			t.Parallel()
 			result, err := parseDuration(test.input)
@@ -128,7 +128,6 @@ func TestParseDuration(t *testing.T) {
 		{"0xFF"},
 	}
 	for _, test := range badTests {
-		test := test
 		t.Run(fmt.Sprintf("bad/%s", test.input), func(t *testing.T) {
 			t.Parallel()
 			_, err := parseDuration(test.input)
@@ -147,33 +146,39 @@ func TestSyntheticByteStream(t *testing.T) {
 
 	t.Run("read", func(t *testing.T) {
 		t.Parallel()
-		s := newSyntheticByteStream(10, factory)
+		s := newSyntheticByteStream(10, 0, factory)
 
 		// read first half
-		p := make([]byte, 5)
-		count, err := s.Read(p)
-		assert.NilError(t, err)
-		assert.Equal(t, count, 5, "incorrect number of bytes read")
-		assert.DeepEqual(t, p, []byte{0, 1, 2, 3, 4}, "incorrect bytes read")
+		{
+			p := make([]byte, 5)
+			count, err := s.Read(p)
+			assert.NilError(t, err)
+			assert.Equal(t, count, 5, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{0, 1, 2, 3, 4}, "incorrect bytes read")
+		}
 
 		// read second half
-		p = make([]byte, 5)
-		count, err = s.Read(p)
-		assert.Error(t, err, io.EOF)
-		assert.Equal(t, count, 5, "incorrect number of bytes read")
-		assert.DeepEqual(t, p, []byte{5, 6, 7, 8, 9}, "incorrect bytes read")
+		{
+			p := make([]byte, 5)
+			count, err := s.Read(p)
+			assert.Error(t, err, io.EOF)
+			assert.Equal(t, count, 5, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{5, 6, 7, 8, 9}, "incorrect bytes read")
+		}
 
 		// can't read any more
-		p = make([]byte, 5)
-		count, err = s.Read(p)
-		assert.Error(t, err, io.EOF)
-		assert.Equal(t, count, 0, "incorrect number of bytes read")
-		assert.DeepEqual(t, p, []byte{0, 0, 0, 0, 0}, "incorrect bytes read")
+		{
+			p := make([]byte, 5)
+			count, err := s.Read(p)
+			assert.Error(t, err, io.EOF)
+			assert.Equal(t, count, 0, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{0, 0, 0, 0, 0}, "incorrect bytes read")
+		}
 	})
 
 	t.Run("read into too-large buffer", func(t *testing.T) {
 		t.Parallel()
-		s := newSyntheticByteStream(5, factory)
+		s := newSyntheticByteStream(5, 0, factory)
 		p := make([]byte, 10)
 		count, err := s.Read(p)
 		assert.Error(t, err, io.EOF)
@@ -183,7 +188,7 @@ func TestSyntheticByteStream(t *testing.T) {
 
 	t.Run("seek", func(t *testing.T) {
 		t.Parallel()
-		s := newSyntheticByteStream(100, factory)
+		s := newSyntheticByteStream(100, 0, factory)
 
 		p := make([]byte, 5)
 		s.Seek(10, io.SeekStart)
@@ -209,6 +214,52 @@ func TestSyntheticByteStream(t *testing.T) {
 
 		_, err = s.Seek(-10, io.SeekStart)
 		assert.Equal(t, err.Error(), "Seek: invalid offset", "incorrect error for invalid offset")
+	})
+
+	t.Run("read over duration", func(t *testing.T) {
+		t.Parallel()
+		s := newSyntheticByteStream(10, 200*time.Millisecond, factory)
+
+		// read first half
+		{
+			p := make([]byte, 5)
+			start := time.Now()
+			count, err := s.Read(p)
+			elapsed := time.Since(start)
+
+			assert.NilError(t, err)
+			assert.Equal(t, count, 5, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{0, 1, 2, 3, 4}, "incorrect bytes read")
+			assert.DurationRange(t, elapsed, 100*time.Millisecond, 175*time.Millisecond)
+		}
+
+		// read second half
+		{
+			p := make([]byte, 5)
+			start := time.Now()
+			count, err := s.Read(p)
+			elapsed := time.Since(start)
+
+			assert.Error(t, err, io.EOF)
+			assert.Equal(t, count, 5, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{5, 6, 7, 8, 9}, "incorrect bytes read")
+			assert.DurationRange(t, elapsed, 100*time.Millisecond, 175*time.Millisecond)
+		}
+
+		// can't read any more
+		{
+			p := make([]byte, 5)
+			start := time.Now()
+			count, err := s.Read(p)
+			elapsed := time.Since(start)
+
+			assert.Error(t, err, io.EOF)
+			assert.Equal(t, count, 0, "incorrect number of bytes read")
+			assert.DeepEqual(t, p, []byte{0, 0, 0, 0, 0}, "incorrect bytes read")
+
+			// read should fail w/ EOF ~immediately
+			assert.DurationRange(t, elapsed, 0, 25*time.Millisecond)
+		}
 	})
 }
 
@@ -284,7 +335,6 @@ func TestGetClientIP(t *testing.T) {
 		},
 	}
 	for name, tc := range testCases {
-		tc := tc
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, getClientIP(tc.given), tc.want, "incorrect client ip")
@@ -482,10 +532,9 @@ func TestParseWeightedChoices(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.given, func(t *testing.T) {
 			t.Parallel()
-			got, err := parseWeightedChoices[int](tc.given, strconv.Atoi)
+			got, err := parseWeightedChoices(tc.given, strconv.Atoi)
 			assert.Error(t, err, tc.wantErr)
 			assert.DeepEqual(t, got, tc.want, "incorrect weighted choices")
 		})
@@ -508,7 +557,6 @@ func TestWeightedRandomChoice(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc, func(t *testing.T) {
 			t.Parallel()
 			choices, err := parseWeightedChoices(tc, func(s string) (string, error) { return s, nil })
@@ -520,7 +568,7 @@ func TestWeightedRandomChoice(t *testing.T) {
 			t.Logf("normalized choices: %v", normalizedChoices)
 
 			result := make(map[string]int, len(choices))
-			for i := 0; i < 1_000; i++ {
+			for range 1_000 {
 				choice := weightedRandomChoice(choices)
 				result[choice]++
 			}
@@ -534,6 +582,79 @@ func TestWeightedRandomChoice(t *testing.T) {
 	}
 }
 
+func TestIsDangerousContentType(t *testing.T) {
+	testCases := []struct {
+		contentType string
+		dangerous   bool
+	}{
+		// We only cosider a handful of content types "safe", everything else
+		// is considered dangerous by default.
+		{"application/json", false},
+		{"application/octet-string", false},
+		{"text/plain", false},
+
+		// Content-Types that can be used for XSS, via:
+		// https://github.com/BlackFan/content-type-research/blob/4e43747254XSS.md#content-type-that-can-be-used-for-xss
+		{"application/mathml+xml", true},
+		{"application/rdf+xml", true},
+		{"application/vnd.wap.xhtml+xml", true},
+		{"application/xhtml+xml", true},
+		{"application/xml", true},
+		{"image/svg+xml", true},
+		{"multipart/x-mixed-replace", true},
+		{"text/cache-manifest", true},
+		{"text/html", true},
+		{"text/rdf", true},
+		{"text/vtt", true},
+		{"text/xml", true},
+		{"text/xsl", true},
+		{"text/xsl", true},
+
+		// weird edge cases
+		{"", true},
+		{"html", true},
+		{"TEXT/HTML", true},
+		{"tExT/HtMl", true},
+	}
+	params := []string{
+		"charset=utf-8",
+		"charset=utf-8; boundary=foo",
+		"charset=utf-8; boundary=foo; foo=bar",
+	}
+	// Suffixes that can trick or confuse browsers, via:
+	// https://github.com/BlackFan/content-type-research/blob/4e43747254XSS.md#content-type-that-can-be-used-for-xss
+	suffixTricks := []string{
+		"; x=x, text/html, foobar",
+		"(xxx",
+		" xxx",
+		",xxx",
+	}
+	for _, tc := range testCases {
+
+		// baseline test
+		t.Run(tc.contentType, func(t *testing.T) {
+			assert.Equal(t, isDangerousContentType(tc.contentType), tc.dangerous, "incorrect result")
+		})
+
+		// ensure that valid mime params do not affect outcome
+		for _, param := range params {
+			contentType := tc.contentType + "; " + param
+			t.Run(tc.contentType+param, func(t *testing.T) {
+				assert.Equal(t, isDangerousContentType(contentType), tc.dangerous, "incorrect result")
+			})
+		}
+
+		// ensure that tricky variations/corruptions are always considered
+		// dangerous
+		for _, trick := range suffixTricks {
+			contentType := tc.contentType + trick
+			t.Run(contentType, func(t *testing.T) {
+				assert.Equal(t, isDangerousContentType(contentType), true, "incorrect dangerous content type")
+			})
+		}
+	}
+}
+
 func normalizeChoices[T any](choices []weightedChoice[T]) []weightedChoice[T] {
 	var totalWeight float64
 	for _, wc := range choices {
@@ -544,4 +665,30 @@ func normalizeChoices[T any](choices []weightedChoice[T]) []weightedChoice[T] {
 		normalized = append(normalized, weightedChoice[T]{Choice: wc.Choice, Weight: wc.Weight / totalWeight})
 	}
 	return normalized
+}
+
+func decodeServerTimings(headerVal string) map[string]serverTiming {
+	if headerVal == "" {
+		return nil
+	}
+	timings := map[string]serverTiming{}
+	for _, entry := range strings.Split(headerVal, ",") {
+		var t serverTiming
+		for _, kv := range strings.Split(entry, ";") {
+			kv = strings.TrimSpace(kv)
+			key, val, _ := strings.Cut(kv, "=")
+			switch key {
+			case "dur":
+				t.dur, _ = time.ParseDuration(val + "ms")
+			case "desc":
+				t.desc = strings.Trim(val, "\"")
+			default:
+				t.name = key
+			}
+		}
+		if t.name != "" {
+			timings[t.name] = t
+		}
+	}
+	return timings
 }

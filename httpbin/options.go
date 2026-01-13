@@ -46,6 +46,14 @@ func WithObserver(o Observer) OptionFunc {
 	}
 }
 
+// WithEnv sets the HTTPBIN_-prefixed environment variables reported
+// by the /env endpoint.
+func WithEnv(env map[string]string) OptionFunc {
+	return func(h *HTTPBin) {
+		h.env = env
+	}
+}
+
 // WithExcludeHeaders sets the headers to exclude in outgoing responses, to
 // prevent possible information leakage.
 func WithExcludeHeaders(excludeHeaders string) OptionFunc {
@@ -78,5 +86,17 @@ func WithAllowedRedirectDomains(hosts []string) OptionFunc {
 
 Allowed redirect destinations:
 %s`, strings.Join(formattedListItems, "\n"))
+	}
+}
+
+// WithUnsafeAllowDangerousResponses means endpoints that allow clients to
+// specify a response Conntent-Type WILL NOT escape HTML entities in the
+// response body, which can enable (e.g.) reflected XSS attacks.
+//
+// This configuration is only supported for backwards compatibility if
+// absolutely necessary.
+func WithUnsafeAllowDangerousResponses() OptionFunc {
+	return func(h *HTTPBin) {
+		h.unsafeAllowDangerousResponses = true
 	}
 }

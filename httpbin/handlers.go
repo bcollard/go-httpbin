@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -33,6 +34,13 @@ func (h *HTTPBin) Index(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' camo.githubusercontent.com")
 	writeHTML(w, h.indexHTML, http.StatusOK)
+}
+
+// Env - returns environment variables with HTTPBIN_ prefix, if any pre-configured by operator
+func (h *HTTPBin) Env(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(http.StatusOK, w, &envResponse{
+		Env: h.env,
+	})
 }
 
 // FormsPost renders an HTML form that submits a request to the /post endpoint
@@ -70,7 +78,8 @@ func (h *HTTPBin) Anything(w http.ResponseWriter, r *http.Request) {
 	h.RequestWithBody(w, r)
 }
 
-// RequestWithBody handles POST, PUT, and PATCH requests
+// RequestWithBody handles POST, PUT, and PATCH requests by responding with a
+// JSON representation of the incoming request.
 func (h *HTTPBin) RequestWithBody(w http.ResponseWriter, r *http.Request) {
 	resp := &bodyResponse{
 		Args:    r.URL.Query(),
@@ -179,7 +188,7 @@ func createSpecialCases(prefix string) map[int]*statusCase {
   ]
 }
 `)
-	statusHTTP300body := []byte(fmt.Sprintf(`<!doctype html>
+	statusHTTP300body := fmt.Appendf(nil, `<!doctype html>
 <head>
 <title>Multiple Choices</title>
 </head>
@@ -189,15 +198,15 @@ func createSpecialCases(prefix string) map[int]*statusCase {
 <li><a href="%[1]s/image/png">/image/png</a></li>
 <li><a href="%[1]s/image/svg">/image/svg</a></li>
 </body>
-</html>`, prefix))
+</html>`, prefix)
 
-	statusHTTP308Body := []byte(fmt.Sprintf(`<!doctype html>
+	statusHTTP308Body := fmt.Appendf(nil, `<!doctype html>
 <head>
 <title>Permanent Redirect</title>
 </head>
 <body>Permanently redirected to <a href="%[1]s/image/jpeg">%[1]s/image/jpeg</a>
 </body>
-</html>`, prefix))
+</html>`, prefix)
 
 	return map[int]*statusCase{
 		300: {
@@ -251,16 +260,11 @@ func createSpecialCases(prefix string) map[int]*statusCase {
 // Status responds with the specified status code. TODO: support random choice
 // from multiple, optionally weighted status codes.
 func (h *HTTPBin) Status(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	rawStatus := parts[2]
+	rawStatus := r.PathValue("code")
 
 	// simple case, specific status code is requested
 	if !strings.Contains(rawStatus, ",") {
-		code, err := parseStatusCode(parts[2])
+		code, err := parseStatusCode(rawStatus)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -329,17 +333,44 @@ func (h *HTTPBin) Unstable(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(status)
 }
 
-// ResponseHeaders responds with a map of header values
+// ResponseHeaders sets every incoming query parameter as a response header and
+// returns the headers serialized as JSON.
+//
+// If the Content-Type query parameter is given and set to a "dangerous" value
+// (i.e. one that might be rendered as HTML in a web browser), the keys and
+// values in the JSON response body will be escaped.
 func (h *HTTPBin) ResponseHeaders(w http.ResponseWriter, r *http.Request) {
 	args := r.URL.Query()
+
+	// only set our own content type if one was not already set based on
+	// incoming request params
+	contentType := args.Get("Content-Type")
+	if contentType == "" {
+		contentType = jsonContentType
+		args.Set("Content-Type", contentType)
+	}
+
+	// actual HTTP response headers are not escaped, regardless of content type
+	// (unlike the JSON serialized representation of those headers in the
+	// response body, which MAY be escaped based on content type)
 	for k, vs := range args {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
-	if contentType := w.Header().Get("Content-Type"); contentType == "" {
-		w.Header().Set("Content-Type", jsonContentType)
+
+	// if response content type is dangrous, escape keys and values before
+	// serializing response body
+	if h.mustEscapeResponse(contentType) {
+		tmp := make(url.Values, len(args))
+		for k, vs := range args {
+			for _, v := range vs {
+				tmp.Add(html.EscapeString(k), html.EscapeString(v))
+			}
+		}
+		args = tmp
 	}
+
 	mustMarshalJSON(w, args)
 }
 
@@ -368,12 +399,7 @@ func (h *HTTPBin) redirectLocation(r *http.Request, relative bool, n int) string
 }
 
 func (h *HTTPBin) handleRedirect(w http.ResponseWriter, r *http.Request, relative bool) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	n, err := strconv.Atoi(parts[2])
+	n, err := strconv.Atoi(r.PathValue("numRedirects"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid redirect count: %w", err))
 		return
@@ -381,7 +407,6 @@ func (h *HTTPBin) handleRedirect(w http.ResponseWriter, r *http.Request, relativ
 		writeError(w, http.StatusBadRequest, errors.New("redirect count must be > 0"))
 		return
 	}
-
 	h.doRedirect(w, h.redirectLocation(r, relative, n-1), http.StatusFound)
 }
 
@@ -421,7 +446,14 @@ func (h *HTTPBin) RedirectTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if u.IsAbs() && len(h.AllowedRedirectDomains) > 0 {
+	// If we're given a URL that includes a domain name and we have a list of
+	// allowed domains, ensure that the domain is allowed.
+	//
+	// Note: This checks the hostname directly rather than using the net.URL's
+	// IsAbs() method, because IsAbs() will return false for URLs that omit
+	// the scheme but include a domain name, like "//evil.com" and it's
+	// important that we validate the domain in these cases as well.
+	if u.Hostname() != "" && len(h.AllowedRedirectDomains) > 0 {
 		if _, ok := h.AllowedRedirectDomains[u.Hostname()]; !ok {
 			// for this error message we do not use our standard JSON response
 			// because we want it to be more obviously human readable.
@@ -483,13 +515,8 @@ func (h *HTTPBin) DeleteCookies(w http.ResponseWriter, r *http.Request) {
 
 // BasicAuth requires basic authentication
 func (h *HTTPBin) BasicAuth(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 4 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	expectedUser := parts[2]
-	expectedPass := parts[3]
+	expectedUser := r.PathValue("user")
+	expectedPass := r.PathValue("password")
 
 	givenUser, givenPass, _ := r.BasicAuth()
 
@@ -509,13 +536,8 @@ func (h *HTTPBin) BasicAuth(w http.ResponseWriter, r *http.Request) {
 // HiddenBasicAuth requires HTTP Basic authentication but returns a status of
 // 404 if the request is unauthorized
 func (h *HTTPBin) HiddenBasicAuth(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 4 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	expectedUser := parts[2]
-	expectedPass := parts[3]
+	expectedUser := r.PathValue("user")
+	expectedPass := r.PathValue("password")
 
 	givenUser, givenPass, _ := r.BasicAuth()
 
@@ -533,12 +555,7 @@ func (h *HTTPBin) HiddenBasicAuth(w http.ResponseWriter, r *http.Request) {
 
 // Stream responds with max(n, 100) lines of JSON-encoded request data.
 func (h *HTTPBin) Stream(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	n, err := strconv.Atoi(parts[2])
+	n, err := strconv.Atoi(r.PathValue("numLines"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid count: %w", err))
 		return
@@ -567,16 +584,53 @@ func (h *HTTPBin) Stream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// set of keys that may not be specified in trailers, per
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Trailer#directives
+var forbiddenTrailers = map[string]struct{}{
+	http.CanonicalHeaderKey("Authorization"):     {},
+	http.CanonicalHeaderKey("Cache-Control"):     {},
+	http.CanonicalHeaderKey("Content-Encoding"):  {},
+	http.CanonicalHeaderKey("Content-Length"):    {},
+	http.CanonicalHeaderKey("Content-Range"):     {},
+	http.CanonicalHeaderKey("Content-Type"):      {},
+	http.CanonicalHeaderKey("Host"):              {},
+	http.CanonicalHeaderKey("Max-Forwards"):      {},
+	http.CanonicalHeaderKey("Set-Cookie"):        {},
+	http.CanonicalHeaderKey("TE"):                {},
+	http.CanonicalHeaderKey("Trailer"):           {},
+	http.CanonicalHeaderKey("Transfer-Encoding"): {},
+}
+
+// Trailers adds the header keys and values specified in the request's query
+// parameters as HTTP trailers in the response.
+//
+// Trailers are returned in canonical form. Any forbidden trailer will result
+// in an error.
+func (h *HTTPBin) Trailers(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	// ensure all requested trailers are allowed
+	for k := range q {
+		if _, found := forbiddenTrailers[http.CanonicalHeaderKey(k)]; found {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("forbidden trailer: %s", k))
+			return
+		}
+	}
+	for k := range q {
+		w.Header().Add("Trailer", k)
+	}
+	h.RequestWithBody(w, r)
+	w.(http.Flusher).Flush() // force chunked transfer encoding even when no trailers are given
+	for k, vs := range q {
+		for _, v := range vs {
+			w.Header().Set(k, v)
+		}
+	}
+}
+
 // Delay waits for a given amount of time before responding, where the time may
 // be specified as a golang-style duration or seconds in floating point.
 func (h *HTTPBin) Delay(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	delay, err := parseBoundedDuration(parts[2], 0, h.MaxDuration)
+	delay, err := parseBoundedDuration(r.PathValue("duration"), 0, h.MaxDuration)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid duration: %w", err))
 		return
@@ -588,11 +642,21 @@ func (h *HTTPBin) Delay(w http.ResponseWriter, r *http.Request) {
 		return
 	case <-time.After(delay):
 	}
+	w.Header().Set("Server-Timing", encodeServerTimings([]serverTiming{
+		{"initial_delay", delay, "initial delay"},
+	}))
 	h.RequestWithBody(w, r)
 }
 
-// Drip returns data over a duration after an optional initial delay, then
-// (optionally) returns with the given status code.
+// Drip simulates a slow HTTP server by writing data over a given duration
+// after an optional initial delay.
+//
+// Because this endpoint is intended to simulate a slow HTTP connection, it
+// intentionally does NOT use chunked transfer encoding even though its
+// implementation writes the response incrementally.
+//
+// See Stream (/stream) or StreamBytes (/stream-bytes) for endpoints that
+// respond using chunked transfer encoding.
 func (h *HTTPBin) Drip(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -641,7 +705,7 @@ func (h *HTTPBin) Drip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if duration+delay > h.MaxDuration {
-		http.Error(w, "Too much time", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, fmt.Errorf("too much time: %v+%v > %v", duration, delay, h.MaxDuration))
 		return
 	}
 
@@ -663,15 +727,22 @@ func (h *HTTPBin) Drip(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", binaryContentType)
+	w.Header().Set("Content-Type", textContentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", numBytes))
+	w.Header().Set("Server-Timing", encodeServerTimings([]serverTiming{
+		{"total_duration", delay + duration, "total request duration"},
+		{"initial_delay", delay, "initial delay"},
+		{"write_duration", duration, "duration of writes after initial delay"},
+		{"pause_per_write", pause, "computed pause between writes"},
+	}))
 	w.WriteHeader(code)
+
+	// what we write with each increment of the ticker
+	b := []byte{'*'}
 
 	// special case when we do not need to pause between each write
 	if pause == 0 {
-		for i := int64(0); i < numBytes; i++ {
-			w.Write([]byte{'*'})
-		}
+		w.Write(bytes.Repeat(b, int(numBytes)))
 		return
 	}
 
@@ -679,7 +750,6 @@ func (h *HTTPBin) Drip(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(pause)
 	defer ticker.Stop()
 
-	b := []byte{'*'}
 	flusher := w.(http.Flusher)
 	for i := int64(0); i < numBytes; i++ {
 		w.Write(b)
@@ -701,19 +771,35 @@ func (h *HTTPBin) Drip(w http.ResponseWriter, r *http.Request) {
 
 // Range returns up to N bytes, with support for HTTP Range requests.
 //
-// This departs from httpbin by not supporting the chunk_size or duration
-// parameters.
+// This departs from original httpbin in a few ways:
+//
+//   - param `chunk_size` IS NOT supported
+//
+//   - param `duration` IS supported, but functions more as a delay before the
+//     whole response is written
+//
+//   - multiple ranges ARE correctly supported (i.e. `Range: bytes=0-1,2-3`
+//     will return a multipart/byteranges response)
+//
+// Most of the heavy lifting is done by the stdlib's http.ServeContent, which
+// handles range requests automatically. Supporting chunk sizes would require
+// an extensive reimplementation, especially to support multiple ranges for
+// correctness. For now, we choose not to take that work on.
 func (h *HTTPBin) Range(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	numBytes, err := strconv.ParseInt(parts[2], 10, 64)
+	numBytes, err := strconv.ParseInt(r.PathValue("numBytes"), 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid count: %w", err))
 		return
+	}
+
+	var duration time.Duration
+	if durationVal := r.URL.Query().Get("duration"); durationVal != "" {
+		var err error
+		duration, err = parseBoundedDuration(r.URL.Query().Get("duration"), 0, h.MaxDuration)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid duration: %w", err))
+			return
+		}
 	}
 
 	w.Header().Add("ETag", fmt.Sprintf("range%d", numBytes))
@@ -724,7 +810,7 @@ func (h *HTTPBin) Range(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content := newSyntheticByteStream(numBytes, func(offset int64) byte {
+	content := newSyntheticByteStream(numBytes, duration, func(offset int64) byte {
 		return byte(97 + (offset % 26))
 	})
 	var modtime time.Time
@@ -756,7 +842,6 @@ func (h *HTTPBin) Cache(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-
 	lastModified := time.Now().Format(time.RFC1123)
 	w.Header().Add("Last-Modified", lastModified)
 	w.Header().Add("ETag", sha1hash(lastModified))
@@ -765,18 +850,11 @@ func (h *HTTPBin) Cache(w http.ResponseWriter, r *http.Request) {
 
 // CacheControl sets a Cache-Control header for N seconds for /cache/N requests
 func (h *HTTPBin) CacheControl(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	seconds, err := strconv.ParseInt(parts[2], 10, 64)
+	seconds, err := strconv.ParseInt(r.PathValue("numSeconds"), 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid seconds: %w", err))
 		return
 	}
-
 	w.Header().Add("Cache-Control", fmt.Sprintf("public, max-age=%d", seconds))
 	h.Get(w, r)
 }
@@ -784,13 +862,7 @@ func (h *HTTPBin) CacheControl(w http.ResponseWriter, r *http.Request) {
 // ETag assumes the resource has the given etag and responds to If-None-Match
 // and If-Match headers appropriately.
 func (h *HTTPBin) ETag(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	etag := parts[2]
+	etag := r.PathValue("etag")
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, etag))
 	w.Header().Set("Content-Type", textContentType)
 
@@ -810,26 +882,20 @@ func (h *HTTPBin) ETag(w http.ResponseWriter, r *http.Request) {
 
 // Bytes returns N random bytes generated with an optional seed
 func (h *HTTPBin) Bytes(w http.ResponseWriter, r *http.Request) {
-	handleBytes(w, r, false)
+	h.handleBytes(w, r, false)
 }
 
 // StreamBytes streams N random bytes generated with an optional seed in chunks
 // of a given size.
 func (h *HTTPBin) StreamBytes(w http.ResponseWriter, r *http.Request) {
-	handleBytes(w, r, true)
+	h.handleBytes(w, r, true)
 }
 
 // handleBytes consolidates the logic for validating input params of the Bytes
 // and StreamBytes endpoints and knows how to write the response in chunks if
 // streaming is true.
-func handleBytes(w http.ResponseWriter, r *http.Request, streaming bool) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	numBytes, err := strconv.Atoi(parts[2])
+func (h *HTTPBin) handleBytes(w http.ResponseWriter, r *http.Request, streaming bool) {
+	numBytes, err := strconv.Atoi(r.PathValue("numBytes"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid byte count: %w", err))
 		return
@@ -855,8 +921,9 @@ func handleBytes(w http.ResponseWriter, r *http.Request, streaming bool) {
 		return
 	}
 
-	if numBytes > 100*1024 {
-		numBytes = 100 * 1024
+	if numBytes > int(h.MaxBodySize) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid byte count: %d not in range [1, %d]", numBytes, h.MaxBodySize))
+		return
 	}
 
 	var chunkSize int
@@ -907,13 +974,7 @@ func handleBytes(w http.ResponseWriter, r *http.Request, streaming bool) {
 
 // Links redirects to the first page in a series of N links
 func (h *HTTPBin) Links(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 && len(parts) != 4 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	n, err := strconv.Atoi(parts[2])
+	n, err := strconv.Atoi(r.PathValue("numLinks"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid link count: %w", err))
 		return
@@ -923,8 +984,8 @@ func (h *HTTPBin) Links(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Are we handling /links/<n>/<offset>? If so, render an HTML page
-	if len(parts) == 4 {
-		offset, err := strconv.Atoi(parts[3])
+	if rawOffset := r.PathValue("offset"); rawOffset != "" {
+		offset, err := strconv.Atoi(rawOffset)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid offset: %w", err))
 			return
@@ -944,7 +1005,7 @@ func (h *HTTPBin) doLinksPage(w http.ResponseWriter, _ *http.Request, n int, off
 	w.WriteHeader(http.StatusOK)
 
 	w.Write([]byte("<html><head><title>Links</title></head><body>"))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i == offset {
 			fmt.Fprintf(w, "%d ", i)
 		} else {
@@ -957,7 +1018,7 @@ func (h *HTTPBin) doLinksPage(w http.ResponseWriter, _ *http.Request, n int, off
 // doRedirect set redirect header
 func (h *HTTPBin) doRedirect(w http.ResponseWriter, path string, code int) {
 	var sb strings.Builder
-	if strings.HasPrefix(path, "/") {
+	if strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") {
 		sb.WriteString(h.prefix)
 	}
 	sb.WriteString(path)
@@ -988,12 +1049,7 @@ func (h *HTTPBin) ImageAccept(w http.ResponseWriter, r *http.Request) {
 
 // Image responds with an image of a specific kind, from /image/<kind>
 func (h *HTTPBin) Image(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	if len(parts) != 3 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-	doImage(w, parts[2])
+	doImage(w, r.PathValue("kind"))
 }
 
 // doImage responds with a specific kind of image, if there is an image asset
@@ -1022,21 +1078,14 @@ func (h *HTTPBin) XML(w http.ResponseWriter, _ *http.Request) {
 // /digest-auth/<qop>/<user>/<passwd>
 // /digest-auth/<qop>/<user>/<passwd>/<algorithm>
 func (h *HTTPBin) DigestAuth(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(r.URL.Path, "/")
-	count := len(parts)
-
-	if count != 5 && count != 6 {
-		writeError(w, http.StatusNotFound, nil)
-		return
-	}
-
-	qop := strings.ToLower(parts[2])
-	user := parts[3]
-	password := parts[4]
-
-	algoName := "MD5"
-	if count == 6 {
-		algoName = strings.ToUpper(parts[5])
+	var (
+		qop      = strings.ToLower(r.PathValue("qop"))
+		user     = r.PathValue("user")
+		password = r.PathValue("password")
+		algoName = strings.ToUpper(r.PathValue("algorithm"))
+	)
+	if algoName == "" {
+		algoName = "MD5"
 	}
 
 	if qop != "auth" {
@@ -1074,12 +1123,20 @@ func (h *HTTPBin) UUID(w http.ResponseWriter, _ *http.Request) {
 
 // Base64 - encodes/decodes input data
 func (h *HTTPBin) Base64(w http.ResponseWriter, r *http.Request) {
-	result, err := newBase64Helper(r.URL.Path, h.MaxBodySize).transform()
+	result, err := newBase64Helper(r, h.MaxBodySize).transform()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeResponse(w, http.StatusOK, textContentType, result)
+	ct := r.URL.Query().Get("content-type")
+	if ct == "" {
+		ct = textContentType
+	}
+	// prevent XSS and other client side vulns if the content type is dangerous
+	if h.mustEscapeResponse(ct) {
+		result = []byte(html.EscapeString(string(result)))
+	}
+	writeResponse(w, http.StatusOK, ct, result)
 }
 
 // DumpRequest - returns the given request in its HTTP/1.x wire representation.
@@ -1128,6 +1185,7 @@ func (h *HTTPBin) Hostname(w http.ResponseWriter, _ *http.Request) {
 // SSE writes a stream of events over a duration after an optional
 // initial delay.
 func (h *HTTPBin) SSE(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	q := r.URL.Query()
 	var (
 		count    = h.DefaultParams.SSECount
@@ -1187,6 +1245,15 @@ func (h *HTTPBin) SSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	w.Header().Add("Trailer", "Server-Timing")
+	defer func() {
+		w.Header().Add("Server-Timing", encodeServerTimings([]serverTiming{
+			{"total_duration", time.Since(start), "total request duration"},
+			{"initial_delay", delay, "initial delay"},
+			{"write_duration", duration, "duration of writes after initial delay"},
+			{"pause_per_write", pause, "computed pause between writes"},
+		}))
+	}()
 	w.Header().Set("Content-Type", sseContentType)
 	w.WriteHeader(http.StatusOK)
 

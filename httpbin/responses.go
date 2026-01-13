@@ -13,6 +13,10 @@ const (
 	textContentType   = "text/plain; charset=utf-8"
 )
 
+type envResponse struct {
+	Env map[string]string `json:"env"`
+}
+
 type headersResponse struct {
 	Headers http.Header `json:"headers"`
 }
@@ -47,10 +51,10 @@ type bodyResponse struct {
 	Origin  string      `json:"origin"`
 	URL     string      `json:"url"`
 
-	Data  string      `json:"data"`
-	Files url.Values  `json:"files"`
-	Form  url.Values  `json:"form"`
-	JSON  interface{} `json:"json"`
+	Data  string     `json:"data"`
+	Files url.Values `json:"files"`
+	Form  url.Values `json:"form"`
+	JSON  any        `json:"json"`
 }
 
 type cookiesResponse map[string]string

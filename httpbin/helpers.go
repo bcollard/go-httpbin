@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -63,7 +65,12 @@ func getClientIP(r *http.Request) string {
 	}
 
 	// Finally, fall back on the actual remote addr from the request.
-	return r.RemoteAddr
+	remoteAddr := r.RemoteAddr
+	if strings.IndexByte(remoteAddr, ':') > 0 {
+		ip, _, _ := net.SplitHostPort(remoteAddr)
+		return ip
+	}
+	return remoteAddr
 }
 
 func getURL(r *http.Request) *url.URL {
@@ -105,7 +112,7 @@ func writeResponse(w http.ResponseWriter, status int, contentType string, body [
 	w.Write(body)
 }
 
-func mustMarshalJSON(w io.Writer, val interface{}) {
+func mustMarshalJSON(w io.Writer, val any) {
 	encoder := json.NewEncoder(w)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "  ")
@@ -114,7 +121,7 @@ func mustMarshalJSON(w io.Writer, val interface{}) {
 	}
 }
 
-func writeJSON(status int, w http.ResponseWriter, val interface{}) {
+func writeJSON(status int, w http.ResponseWriter, val any) {
 	w.Header().Set("Content-Type", jsonContentType)
 	w.WriteHeader(status)
 	mustMarshalJSON(w, val)
@@ -248,13 +255,13 @@ func parseStatusCode(input string) (int, error) {
 	return parseBoundedStatusCode(input, 100, 599)
 }
 
-func parseBoundedStatusCode(input string, min, max int) (int, error) {
+func parseBoundedStatusCode(input string, minVal, maxVal int) (int, error) {
 	code, err := strconv.Atoi(input)
 	if err != nil {
 		return 0, fmt.Errorf("invalid status code: %q: %w", input, err)
 	}
-	if code < min || code > max {
-		return 0, fmt.Errorf("invalid status code: %d not in range [%d, %d]", code, min, max)
+	if code < minVal || code > maxVal {
+		return 0, fmt.Errorf("invalid status code: %d not in range [%d, %d]", code, minVal, maxVal)
 	}
 	return code, nil
 }
@@ -276,16 +283,16 @@ func parseDuration(input string) (time.Duration, error) {
 
 // parseBoundedDuration parses a time.Duration from user input and ensures that
 // it is within a given maximum and minimum time
-func parseBoundedDuration(input string, min, max time.Duration) (time.Duration, error) {
+func parseBoundedDuration(input string, minVal, maxVal time.Duration) (time.Duration, error) {
 	d, err := parseDuration(input)
 	if err != nil {
 		return 0, err
 	}
 
-	if d > max {
-		err = fmt.Errorf("duration %s longer than %s", d, max)
-	} else if d < min {
-		err = fmt.Errorf("duration %s shorter than %s", d, min)
+	if d > maxVal {
+		err = fmt.Errorf("duration %s longer than %s", d, maxVal)
+	} else if d < minVal {
+		err = fmt.Errorf("duration %s shorter than %s", d, minVal)
 	}
 	return d, err
 }
@@ -314,17 +321,21 @@ func parseSeed(rawSeed string) (*rand.Rand, error) {
 type syntheticByteStream struct {
 	mu sync.Mutex
 
-	size    int64
-	offset  int64
-	factory func(int64) byte
+	size         int64
+	factory      func(int64) byte
+	pausePerByte time.Duration
+
+	// internal offset for tracking the current position in the stream
+	offset int64
 }
 
 // newSyntheticByteStream returns a new stream of bytes of a specific size,
 // given a factory function for generating the byte at a given offset.
-func newSyntheticByteStream(size int64, factory func(int64) byte) io.ReadSeeker {
+func newSyntheticByteStream(size int64, duration time.Duration, factory func(int64) byte) io.ReadSeeker {
 	return &syntheticByteStream{
-		size:    size,
-		factory: factory,
+		size:         size,
+		pausePerByte: duration / time.Duration(size),
+		factory:      factory,
 	}
 }
 
@@ -344,8 +355,11 @@ func (s *syntheticByteStream) Read(p []byte) (int, error) {
 	for idx := start; idx < end; idx++ {
 		p[idx-start] = s.factory(idx)
 	}
-
 	s.offset = end
+
+	if s.pausePerByte > 0 {
+		time.Sleep(s.pausePerByte * time.Duration(end-start))
+	}
 
 	return int(end - start), err
 }
@@ -400,19 +414,14 @@ type base64Helper struct {
 // in one of two forms:
 // - /base64/<base64_encoded_data>
 // - /base64/<operation>/<base64_encoded_data>
-func newBase64Helper(path string, maxLen int64) *base64Helper {
-	parts := strings.SplitN(path, "/", 4)
-	b := &base64Helper{maxLen: maxLen}
-	switch len(parts) {
-	// Any other cases will be rejected when transform() is called
-	case 3:
-		// handle /base64/<base64_encoded_data>
+func newBase64Helper(r *http.Request, maxLen int64) *base64Helper {
+	b := &base64Helper{
+		operation: r.PathValue("operation"),
+		data:      r.PathValue("data"),
+		maxLen:    maxLen,
+	}
+	if b.operation == "" {
 		b.operation = "decode"
-		b.data = parts[2]
-	case 4:
-		// handle /base64/<operation>/<base64_encoded_data>
-		b.operation = parts[2]
-		b.data = parts[3]
 	}
 	return b
 }
@@ -567,4 +576,44 @@ func weightedRandomChoice[T any](choices []weightedChoice[T]) T {
 		}
 	}
 	panic("failed to select a weighted random choice")
+}
+
+// Server-Timing header/trailer helpers. See MDN docs for reference:
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server-Timing
+type serverTiming struct {
+	name string
+	dur  time.Duration
+	desc string
+}
+
+func encodeServerTimings(timings []serverTiming) string {
+	entries := make([]string, len(timings))
+	for i, t := range timings {
+		ms := t.dur.Seconds() * 1e3
+		entries[i] = fmt.Sprintf("%s;dur=%0.2f;desc=\"%s\"", t.name, ms, t.desc)
+	}
+	return strings.Join(entries, ", ")
+}
+
+// The following content types are considered safe enough to skip HTML-escaping
+// response bodies.
+//
+// See [1] for an example of the wide variety of unsafe content types, which
+// varies by browser vendor and could change in the future.
+//
+// [1]: https://github.com/BlackFan/content-type-research/blob/4e4347254/XSS.md
+var safeContentTypes = map[string]bool{
+	"text/plain":               true,
+	"application/json":         true,
+	"application/octet-string": true,
+}
+
+// isDangerousContentType determines whether the given Content-Type header
+// value could be unsafe (e.g. at risk of XSS) when rendered by a web browser.
+func isDangerousContentType(ct string) bool {
+	mediatype, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return true
+	}
+	return !safeContentTypes[mediatype]
 }
